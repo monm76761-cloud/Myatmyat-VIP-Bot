@@ -1,4 +1,4 @@
-import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid, html, sys, io
+import telebot, asyncio, aiohttp, json, base64, random, re, os, string, time, uuid, html, sys, io, secrets
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -62,9 +62,56 @@ def is_admin(chat_id):
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
 
+
+def _dashboard_authorized(request):
+    supplied = request.query.get("token", "")
+    expected = os.environ.get("DASHBOARD_TOKEN", "")
+    return bool(expected) and secrets.compare_digest(supplied, expected)
+
+
+def _dashboard_headers(request):
+    allowed = os.environ.get("DASHBOARD_ORIGIN", "")
+    origin = request.headers.get("Origin", "")
+    return {
+        "Access-Control-Allow-Origin": allowed if allowed and origin == allowed else "null",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Cache-Control": "no-store",
+    }
+
+
+async def dashboard_metrics(request):
+    headers = _dashboard_headers(request)
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=headers)
+    if not _dashboard_authorized(request):
+        return web.json_response({"error": "Dashboard authentication required"}, status=401, headers=headers)
+    elapsed = int(time.monotonic() - _start_time)
+    active_scans = sum(1 for data in scan_tasks.values() if data.get("task") is not None and not data["task"].done())
+    payload = {
+        "status": "online",
+        "uptime_seconds": elapsed,
+        "active_scans": active_scans,
+        "approved_users": sum(1 for value in approve.values() if value),
+        "sessions_loaded": len(user_data),
+        "scan_stats": list(scan_stats.items())[-20:],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    return web.json_response(payload, headers=headers)
+
+
+async def dashboard_page(request):
+    if not _dashboard_authorized(request):
+        return web.Response(status=401, text="Dashboard authentication required")
+    return web.Response(text="Dashboard API is online. Use /api/metrics?token=YOUR_DASHBOARD_TOKEN", content_type="text/plain")
+
+
 async def web_server():
     app = web.Application()
     app.router.add_get('/', handle)
+    app.router.add_get('/dashboard', dashboard_page)
+    app.router.add_route('OPTIONS', '/api/metrics', dashboard_metrics)
+    app.router.add_get('/api/metrics', dashboard_metrics)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 8097))
