@@ -61,7 +61,13 @@ USER_REGISTRY_LOCK = asyncio.Lock()
 
 session = None
 _connector = None
+HTTPS_PROXY_URL = os.environ.get("HTTPS_PROXY_URL", "").strip()
 CONCURRENCY = 2000
+
+
+def _proxy_kwargs():
+    """Return a single configured egress proxy without exposing its credentials."""
+    return {"proxy": HTTPS_PROXY_URL} if HTTPS_PROXY_URL else {}
 # Runtime scan-speed cap in codes/minute. None means unlimited.
 SPEED_LIMIT = None
 _voucher_sem = None
@@ -186,7 +192,7 @@ async def web_server():
 async def get_file_content(path):
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    async with session.get(url, headers=headers) as response:
+    async with session.get(url, headers=headers, **_proxy_kwargs()) as response:
         if response.status == 200:
             data = await response.json()
             content = base64.b64decode(data['content']).decode('utf-8')
@@ -206,7 +212,7 @@ async def update_file_content(path, content, sha, message):
     }
     if sha:
         payload["sha"] = sha
-    async with session.put(url, headers=headers, json=payload) as response:
+    async with session.put(url, headers=headers, json=payload, **_proxy_kwargs()) as response:
         return await response.text()
 
 
@@ -2068,6 +2074,7 @@ async def get_session_id(session, session_url, previous_session_id=None):
             headers=headers,
             allow_redirects=True,
             timeout=timeout,
+            **_proxy_kwargs(),
         ) as req:
             candidates = [str(req.url)]
             candidates.extend(str(item.url) for item in getattr(req, 'history', ()))
@@ -2166,7 +2173,7 @@ async def perform_check(session_url, code, chat_id, scan_id=None, recheck=False,
                 "user-agent": "Mozilla/5.0 (Linux; Android 12; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
             }
             try:
-                async with task_session.post(post_url, json=data, headers=headers) as req:
+                async with task_session.post(post_url, json=data, headers=headers, **_proxy_kwargs()) as req:
                     response = await req.text()
                     resp_json = json.loads(response)
                     print(f"[voucher] code={code} attempt={_attempt+1} status={req.status} resp={resp_json}")
@@ -2274,7 +2281,8 @@ async def Code_Expires_Date(session_id):
         ) as fresh_session:
             async with fresh_session.get(
                 f'https://portal-as.ruijienetworks.com/api/auth/balance/getBalance/{session_id}',
-                headers=headers
+                headers=headers,
+                **_proxy_kwargs(),
             ) as req:
                 respond = await req.json()
                 profile_name = respond.get('result', {}).get('profileName', 'Unknown')
@@ -2320,7 +2328,7 @@ async def Captcha_Image(session, session_id):
         'sessionId': session_id,
         '_t': str(time.time()),
     }
-    async with session.get('https://portal-as.ruijienetworks.com/api/auth/captcha/image', params=params, headers=headers) as req:
+    async with session.get('https://portal-as.ruijienetworks.com/api/auth/captcha/image', params=params, headers=headers, **_proxy_kwargs()) as req:
         return await req.read()
 
 async def Varify_Captcha(session, session_id, text):
@@ -2343,7 +2351,7 @@ async def Varify_Captcha(session, session_id, text):
         'sessionId': session_id,
         'authCode': text,
     }
-    async with session.post('https://portal-as.ruijienetworks.com/api/auth/captcha/verify', headers=headers, json=json_data) as req:
+    async with session.post('https://portal-as.ruijienetworks.com/api/auth/captcha/verify', headers=headers, json=json_data, **_proxy_kwargs()) as req:
         data = await req.json()
         print(f"[Varify_Captcha] status={req.status} authCode={text} response={data}")
         if data.get("success") == True:
