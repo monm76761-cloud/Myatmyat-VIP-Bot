@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+python-dotenv
+aiohttp
+opencv-python-headless
+ddddocr
+numpy
