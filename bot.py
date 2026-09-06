@@ -41,6 +41,11 @@ AUTO_NOTIFY_ENABLED = os.environ.get("AUTO_NOTIFY_ENABLED", "1").lower() not in 
 AUTO_NOTIFY_INTERVAL_HOURS = max(1, int(os.environ.get("AUTO_NOTIFY_INTERVAL_HOURS", "24")))
 AUTO_NOTIFY_DAYS = tuple(sorted({int(value) for value in os.environ.get("AUTO_NOTIFY_DAYS", "7,3,1").split(",") if value.strip()}, reverse=True))
 NOTIFICATION_HISTORY_FILE = os.environ.get("NOTIFICATION_HISTORY_FILE", "expiry_notification_history.json")
+USERS_FILE = os.environ.get("USERS_FILE", "users.json")
+USER_REGISTRY = {}
+USER_REGISTRY_SHA = None
+USER_REGISTRY_LOCK = asyncio.Lock()
+
 
 session = None
 _connector = None
@@ -112,6 +117,7 @@ async def web_server():
     app.router.add_get('/dashboard', dashboard_page)
     app.router.add_route('OPTIONS', '/api/metrics', dashboard_metrics)
     app.router.add_get('/api/metrics', dashboard_metrics)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 8097))
@@ -138,11 +144,81 @@ async def update_file_content(path, content, sha, message):
     encoded = base64.b64encode(json.dumps(content).encode()).decode()
     payload = {
         "message": message,
-        "content": encoded,
-        "sha": sha
+        "content": encoded
     }
+    if sha:
+        payload["sha"] = sha
     async with session.put(url, headers=headers, json=payload) as response:
         return await response.text()
+
+
+async def load_user_registry():
+    """Load non-sensitive user metadata from GitHub into memory."""
+    global USER_REGISTRY, USER_REGISTRY_SHA
+    data, sha = await get_file_content(USERS_FILE)
+    USER_REGISTRY = data if isinstance(data, dict) else {}
+    USER_REGISTRY_SHA = sha
+    for chat_id, profile in list(USER_REGISTRY.items()):
+        if not isinstance(profile, dict):
+            profile = {}
+            USER_REGISTRY[chat_id] = profile
+        try:
+            numeric_id = int(chat_id)
+        except (TypeError, ValueError):
+            continue
+        user_data.setdefault(numeric_id, {})
+        user_data[numeric_id].update({
+            key: profile.get(key) for key in ("display_name", "username", "active_key")
+            if profile.get(key) is not None
+        })
+        if profile.get("language") in {"my", "en"}:
+            language_prefs[numeric_id] = profile["language"]
+        if profile.get("blocked"):
+            approve[numeric_id] = False
+
+
+async def save_user_registry():
+    """Persist only safe metadata; session URLs and scan data never go to GitHub."""
+    global USER_REGISTRY, USER_REGISTRY_SHA
+    async with USER_REGISTRY_LOCK:
+        latest, latest_sha = await get_file_content(USERS_FILE)
+        if isinstance(latest, dict):
+            USER_REGISTRY.update(latest)
+        payload = json.loads(json.dumps(USER_REGISTRY, ensure_ascii=False))
+        response_text = await update_file_content(
+            USERS_FILE, payload, latest_sha or USER_REGISTRY_SHA,
+            "Update Telegram user registry"
+        )
+        try:
+            response_data = json.loads(response_text)
+            USER_REGISTRY_SHA = response_data.get("content", {}).get("sha") or latest_sha or USER_REGISTRY_SHA
+        except (TypeError, ValueError, AttributeError):
+            USER_REGISTRY_SHA = latest_sha or USER_REGISTRY_SHA
+
+
+def register_user(message):
+    """Update in-memory profile and return whether the user is blocked."""
+    chat_id = str(message.chat.id)
+    user = message.from_user
+    profile = USER_REGISTRY.setdefault(chat_id, {})
+    profile.update({
+        "user_id": message.chat.id,
+        "display_name": user.full_name or "VIP User",
+        "username": user.username or "",
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+        "language": language_prefs.get(message.chat.id, profile.get("language", "my")),
+        "blocked": bool(profile.get("blocked", False)),
+    })
+    profile.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+    return profile["blocked"]
+
+
+def user_record(chat_id):
+    return USER_REGISTRY.get(str(chat_id), {})
+
+
+def is_blocked(chat_id):
+    return bool(user_record(chat_id).get("blocked"))
 
 def format_key_remaining(key_data):
     """Return remaining key time, recalculated on every /start request."""
@@ -264,12 +340,22 @@ def admin_menu_markup():
         telebot.types.InlineKeyboardButton("💾 Backup", callback_data="menu:backup"),
         telebot.types.InlineKeyboardButton("🔃 Data ပြန်ဖတ်ရန်", callback_data="menu:reload"),
         telebot.types.InlineKeyboardButton("🛑 Scanner အားလုံးရပ်ရန်", callback_data="menu:cancelall"),
+        telebot.types.InlineKeyboardButton("👥 User စီမံရန်", callback_data="menu:users"),
+        telebot.types.InlineKeyboardButton("🔎 User ရှာရန်", callback_data="menu:usersearch"),
     )
     return markup
 
 
 @bot.message_handler(commands=['start'])
 async def start(message):
+    blocked = register_user(message)
+    try:
+        await save_user_registry()
+    except Exception as exc:
+        print(f"User registry save error: {exc}")
+    if blocked and not is_admin(message.chat.id):
+        await bot.reply_to(message, "🚫 သင့် account ကို စီမံခန့်ခွဲသူက ပိတ်ထားပါတယ်။")
+        return
     user_data.setdefault(message.chat.id, {})
     key_info = await get_active_key_info(message.chat.id)
     active = key_info is not None
@@ -380,6 +466,12 @@ async def menu_callback(call):
     if command == "cancelall":
         await cancel_all_command(call.message)
         return
+    if command == "users":
+        await users_command(call.message)
+        return
+    if command == "usersearch":
+        await bot.send_message(chat_id, "🔎 အသုံးပြုပုံ: <code>/user USER_ID</code> သို့မဟုတ် <code>/users search စာလုံး</code>", parse_mode="HTML")
+        return
     if command == "notify_expiring":
         await bot.send_message(chat_id, "🔔 အသုံးပြုပုံ: /notify_expiring 3\n\n၃ ရက်အတွင်း key ကုန်မည့်သူများကို စစ်ပြီး confirmation ပြပါမယ်။")
         return
@@ -468,6 +560,163 @@ async def utility_callback(call):
         await bot.send_message(chat_id, "ℹ️ ကြေညာချက်ပို့ခြင်းကို ပယ်ဖျက်လိုက်ပါပြီ။")
 
 
+def admin_user_list_markup(user_ids):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    for chat_id in user_ids[:20]:
+        profile = user_record(chat_id)
+        label = (profile.get("display_name") or str(chat_id))[:24]
+        markup.add(telebot.types.InlineKeyboardButton(
+            f"👤 {label}", callback_data=f"user:view:{chat_id}"
+        ))
+    markup.add(
+        telebot.types.InlineKeyboardButton("🔄 Refresh", callback_data="user:list"),
+        telebot.types.InlineKeyboardButton("🏠 Admin menu", callback_data="menu:admin"),
+    )
+    return markup
+
+
+def user_detail_text(chat_id):
+    profile = user_record(chat_id)
+    runtime = user_data.get(int(chat_id), {})
+    status = "🚫 Blocked" if profile.get("blocked") else "✅ Active"
+    key = runtime.get("active_key") or profile.get("active_key") or "None"
+    return (
+        "👤 <b>User Details</b>\n\n"
+        f"🆔 ID: <code>{html.escape(str(chat_id))}</code>\n"
+        f"👤 Name: {html.escape(str(profile.get('display_name') or 'Unknown'))}\n"
+        f"🔖 Username: @{html.escape(str(profile.get('username') or 'Not set'))}\n"
+        f"📌 Status: <b>{status}</b>\n"
+        f"🔑 Active key: <code>{html.escape(str(key))}</code>\n"
+        f"🗓 Created: {html.escape(str(profile.get('created_at') or 'Unknown'))}\n"
+        f"🕒 Last seen: {html.escape(str(profile.get('last_seen') or 'Unknown'))}"
+    )
+
+
+def user_detail_markup(chat_id):
+    action = "unban" if is_blocked(chat_id) else "ban"
+    label = "✅ Unban" if action == "unban" else "🚫 Ban"
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        telebot.types.InlineKeyboardButton(label, callback_data=f"user:{action}:{chat_id}"),
+        telebot.types.InlineKeyboardButton("🧹 Reset", callback_data=f"user:reset:{chat_id}"),
+        telebot.types.InlineKeyboardButton("⬅️ Users", callback_data="user:list"),
+    )
+    return markup
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("user:"))
+async def user_management_callback(call):
+    await bot.answer_callback_query(call.id)
+    if not is_admin(call.message.chat.id):
+        await bot.send_message(call.message.chat.id, "⛔ စီမံခန့်ခွဲသူခွင့်ပြုချက် လိုအပ်ပါတယ်။")
+        return
+    parts = call.data.split(":", 2)
+    action = parts[1]
+    if action == "list":
+        await users_command(call.message)
+        return
+    if len(parts) < 3 or not parts[2].lstrip("-").isdigit():
+        await bot.send_message(call.message.chat.id, "❌ User ID မမှန်ပါ။")
+        return
+    target_id = int(parts[2])
+    profile = USER_REGISTRY.setdefault(str(target_id), {"user_id": target_id})
+    if action == "view":
+        await bot.send_message(call.message.chat.id, user_detail_text(target_id), parse_mode="HTML", reply_markup=user_detail_markup(target_id))
+        return
+    if action in {"ban", "unban"}:
+        if target_id == call.message.chat.id:
+            await bot.send_message(call.message.chat.id, "❌ ကိုယ့်ကိုယ်ကို ban မလုပ်နိုင်ပါ။")
+            return
+        profile["blocked"] = action == "ban"
+        if action == "ban":
+            approve[target_id] = False
+            task_info = scan_tasks.get(target_id)
+            if task_info and not task_info["task"].done():
+                task_info["stop"] = True
+                task_info["task"].cancel()
+        await save_user_registry()
+        await bot.send_message(call.message.chat.id, f"✅ User {target_id} ကို {'ပိတ်' if action == 'ban' else 'ပြန်ဖွင့်'} ပြီးပါပြီ။")
+        return
+    if action == "reset":
+        user_data.pop(target_id, None)
+        approve.pop(target_id, None)
+        profile["active_key"] = None
+        profile["reset_at"] = datetime.now(timezone.utc).isoformat()
+        await save_user_registry()
+        await bot.send_message(call.message.chat.id, f"✅ User {target_id} ၏ session နှင့် access ကို reset လုပ်ပြီးပါပြီ။")
+
+
+@bot.message_handler(commands=['users'])
+async def users_command(message):
+    if not is_admin(message.chat.id):
+        await bot.reply_to(message, "⛔ စီမံခန့်ခွဲသူခွင့်ပြုချက် လိုအပ်ပါတယ်။")
+        return
+    args = message.text.split(maxsplit=1)
+    query = args[1].strip().lower() if len(args) > 1 else ""
+    records = []
+    for chat_id, profile in USER_REGISTRY.items():
+        haystack = " ".join([str(chat_id), str(profile.get("display_name", "")), str(profile.get("username", ""))]).lower()
+        if not query or query in haystack:
+            records.append(chat_id)
+    records.sort(key=lambda value: USER_REGISTRY[value].get("last_seen", ""), reverse=True)
+    if not records:
+        await bot.reply_to(message, "📭 User မတွေ့ပါ။")
+        return
+    lines = [f"👥 <b>Users: {len(records)}</b>"]
+    for chat_id in records[:20]:
+        profile = USER_REGISTRY[chat_id]
+        state = "🚫" if profile.get("blocked") else "✅"
+        lines.append(f"{state} <code>{html.escape(str(chat_id))}</code> — {html.escape(str(profile.get('display_name') or 'Unknown'))}")
+    if len(records) > 20:
+        lines.append(f"\nပြသထားသည်: 20 / {len(records)} — search သုံးပြီး ထပ်ရှာနိုင်ပါတယ်။")
+    await bot.reply_to(message, "\n".join(lines), parse_mode="HTML", reply_markup=admin_user_list_markup(records))
+
+
+@bot.message_handler(commands=['user'])
+async def user_command(message):
+    if not is_admin(message.chat.id):
+        await bot.reply_to(message, "⛔ စီမံခန့်ခွဲသူခွင့်ပြုချက် လိုအပ်ပါတယ်။")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().lstrip("-").isdigit():
+        await bot.reply_to(message, "အသုံးပြုပုံ: /user USER_ID")
+        return
+    target_id = int(args[1].strip())
+    if str(target_id) not in USER_REGISTRY:
+        await bot.reply_to(message, "📭 User မတွေ့ပါ။")
+        return
+    await bot.reply_to(message, user_detail_text(target_id), parse_mode="HTML", reply_markup=user_detail_markup(target_id))
+
+
+@bot.message_handler(commands=['ban', 'unban', 'resetuser'])
+async def user_action_command(message):
+    if not is_admin(message.chat.id):
+        await bot.reply_to(message, "⛔ စီမံခန့်ခွဲသူခွင့်ပြုချက် လိုအပ်ပါတယ်။")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().lstrip("-").isdigit():
+        await bot.reply_to(message, "အသုံးပြုပုံ: /ban USER_ID, /unban USER_ID သို့မဟုတ် /resetuser USER_ID")
+        return
+    target_id = int(args[1].strip())
+    profile = USER_REGISTRY.setdefault(str(target_id), {"user_id": target_id})
+    command = message.text.split()[0].lower().lstrip("/")
+    if target_id == message.chat.id and command == "ban":
+        await bot.reply_to(message, "❌ ကိုယ့်ကိုယ်ကို ban မလုပ်နိုင်ပါ။")
+        return
+    if command == "ban":
+        profile["blocked"] = True
+        approve[target_id] = False
+    elif command == "unban":
+        profile["blocked"] = False
+    else:
+        user_data.pop(target_id, None)
+        approve.pop(target_id, None)
+        profile["active_key"] = None
+        profile["reset_at"] = datetime.now(timezone.utc).isoformat()
+    await save_user_registry()
+    await bot.reply_to(message, f"✅ User {target_id} အတွက် {command} လုပ်ဆောင်ချက်ပြီးပါပြီ။")
+
+
 @bot.message_handler(commands=['profile'])
 async def profile_command(message):
     key_info = await get_active_key_info(message.chat.id)
@@ -520,6 +769,8 @@ async def language_command(message):
         await bot.reply_to(message, "❌ `my` သို့မဟုတ် `en` ကိုသာ အသုံးပြုပါ။", parse_mode="Markdown")
         return
     language_prefs[message.chat.id] = "en" if choice == "en" else "my"
+    USER_REGISTRY.setdefault(str(message.chat.id), {}).update({"language": language_prefs[message.chat.id]})
+    await save_user_registry()
     await bot.reply_to(message, "✅ ဘာသာစကား setting ကို သိမ်းပြီးပါပြီ။ လက်ရှိ menu သည် မြန်မာစာဖြင့် ပြသထားပါတယ်။")
 
 
@@ -755,6 +1006,10 @@ async def help_command(message):
         "💾 `/backup` - safe backup ဖိုင်ရယူရန်\n"
         "🔃 `/reload` - GitHub data ပြန်ဖတ်ရန်\n"
         "🛑 `/cancelall` - scanner အားလုံးရပ်ရန်\n"
+        "👥 `/users` - User စာရင်းနှင့် စီမံခန့်ခွဲမှု\n"
+        "🔎 `/user USER_ID` - User အသေးစိတ်\n"
+        "🚫 `/ban USER_ID` / `/unban USER_ID` - User ပိတ်/ဖွင့်\n"
+        "🧹 `/resetuser USER_ID` - User session နှင့် access reset\n"
         "🔔 `/notify_expiring 3` - key ကုန်ခါနီးသူများကို အသိပေးရန်\n"
         "♻️ `/restart` - Bot ပြန်စရန်",
         parse_mode="Markdown"
@@ -771,6 +1026,8 @@ async def help_command(message):
             telebot.types.InlineKeyboardButton("💾 Backup", callback_data="menu:backup"),
             telebot.types.InlineKeyboardButton("🔃 Data ပြန်ဖတ်ရန်", callback_data="menu:reload"),
             telebot.types.InlineKeyboardButton("🛑 Scanner အားလုံးရပ်ရန်", callback_data="menu:cancelall"),
+            telebot.types.InlineKeyboardButton("👥 User စီမံရန်", callback_data="menu:users"),
+            telebot.types.InlineKeyboardButton("🔎 User ရှာရန်", callback_data="menu:usersearch"),
         )
         await bot.send_message(message.chat.id, "👑 စီမံခန့်ခွဲသူကိရိယာများ", reply_markup=admin_markup)
 
@@ -778,6 +1035,9 @@ async def help_command(message):
 
 @bot.message_handler(commands=['key'])
 async def handle_key(message):
+    if is_blocked(message.chat.id) and not is_admin(message.chat.id):
+        await bot.reply_to(message, "🚫 သင့် account ကို ပိတ်ထားပါတယ်။")
+        return
     if is_admin(message.chat.id):
         approve[message.chat.id] = True
         user_data.setdefault(message.chat.id, {})
@@ -795,6 +1055,11 @@ async def handle_key(message):
         approve[message.chat.id] = True
         user_data.setdefault(message.chat.id, {})
         user_data[message.chat.id]["active_key"] = matched_key
+        USER_REGISTRY.setdefault(str(message.chat.id), {}).update({
+            "active_key": matched_key,
+            "key_activated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        await save_user_registry()
         await bot.reply_to(
             message,
             "✅ **Key Activated!**\n\n📊 Status: Active\n\nUse /input to save your session URL.",
@@ -1179,6 +1444,9 @@ async def check_session_url(session_url):
 
 @bot.message_handler(commands=['input'])
 async def handle_input(message):
+    if is_blocked(message.chat.id) and not is_admin(message.chat.id):
+        await bot.reply_to(message, "🚫 သင့် account ကို ပိတ်ထားပါတယ်။")
+        return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await bot.reply_to(
@@ -1232,6 +1500,9 @@ async def scan(message):
         return
     mode = args[1]
     chat_id = message.chat.id
+    if is_blocked(chat_id) and not is_admin(chat_id):
+        await bot.reply_to(message, "🚫 သင့် account ကို ပိတ်ထားပါတယ်။")
+        return
     if not is_admin(chat_id) and not approve.get(chat_id, False):
         await bot.reply_to(message, "⚠️ အသုံးပြုရန် /key <key> ဖြင့် အတည်ပြုပါ။")
         return
@@ -2133,6 +2404,7 @@ async def main():
         connector_owner=False
     )
     try:
+        await load_user_registry()
         if os.environ.get("DISABLE_BOT_WEB_SERVER", "0") != "1":
             asyncio.create_task(web_server())
         asyncio.create_task(github_update_scheduler())
