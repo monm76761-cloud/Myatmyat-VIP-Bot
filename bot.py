@@ -43,6 +43,8 @@ AUTO_NOTIFY_DAYS = tuple(sorted({int(value) for value in os.environ.get("AUTO_NO
 NOTIFICATION_HISTORY_FILE = os.environ.get("NOTIFICATION_HISTORY_FILE", "expiry_notification_history.json")
 METRICS_TOKEN = os.environ.get("METRICS_TOKEN", "") or os.environ.get("DASHBOARD_TOKEN", "")
 DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "https://stlinkdash-9eyizxud.manus.space").rstrip("/")
+RESTART_COOLDOWN_SECONDS = max(30, int(os.environ.get("RESTART_COOLDOWN_SECONDS", "120")))
+_last_restart_request = 0.0
 USERS_FILE = os.environ.get("USERS_FILE", "users.json")
 USER_REGISTRY = {}
 USER_REGISTRY_SHA = None
@@ -118,12 +120,42 @@ async def dashboard_page(request):
     return web.Response(text="Dashboard API is online. Use Authorization: Bearer <METRICS_TOKEN>", content_type="text/plain")
 
 
+async def _restart_service_later():
+    await asyncio.sleep(0.5)
+    process = await asyncio.create_subprocess_exec(
+        "sudo", "-n", "systemctl", "restart", "myatmyat-bot.service",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await process.wait()
+
+
+async def restart_endpoint(request):
+    global _last_restart_request
+    headers = _dashboard_headers(request)
+    if request.headers.get("Origin", "") not in {"", DASHBOARD_ORIGIN}:
+        return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403, headers=headers)
+    if not _dashboard_authorized(request):
+        headers["WWW-Authenticate"] = 'Bearer realm="STLINK Restart"'
+        return web.json_response({"ok": False, "error": "restart authentication required"}, status=401, headers=headers)
+    now = time.monotonic()
+    if now - _last_restart_request < RESTART_COOLDOWN_SECONDS:
+        retry_after = int(RESTART_COOLDOWN_SECONDS - (now - _last_restart_request)) + 1
+        headers["Retry-After"] = str(retry_after)
+        return web.json_response({"ok": False, "error": "restart cooldown active", "retry_after": retry_after}, status=429, headers=headers)
+    _last_restart_request = now
+    asyncio.create_task(_restart_service_later())
+    return web.json_response({"ok": True, "status": "restart_requested", "retry_after": RESTART_COOLDOWN_SECONDS}, status=202, headers=headers)
+
+
 async def web_server():
     app = web.Application()
     app.router.add_get('/', handle)
     app.router.add_get('/dashboard', dashboard_page)
     app.router.add_route('OPTIONS', '/api/metrics', dashboard_metrics)
     app.router.add_get('/api/metrics', dashboard_metrics)
+    app.router.add_route('OPTIONS', '/api/restart', dashboard_metrics)
+    app.router.add_post('/api/restart', restart_endpoint)
 
     runner = web.AppRunner(app)
     await runner.setup()
