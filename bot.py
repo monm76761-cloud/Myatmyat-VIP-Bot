@@ -41,6 +41,8 @@ AUTO_NOTIFY_ENABLED = os.environ.get("AUTO_NOTIFY_ENABLED", "1").lower() not in 
 AUTO_NOTIFY_INTERVAL_HOURS = max(1, int(os.environ.get("AUTO_NOTIFY_INTERVAL_HOURS", "24")))
 AUTO_NOTIFY_DAYS = tuple(sorted({int(value) for value in os.environ.get("AUTO_NOTIFY_DAYS", "7,3,1").split(",") if value.strip()}, reverse=True))
 NOTIFICATION_HISTORY_FILE = os.environ.get("NOTIFICATION_HISTORY_FILE", "expiry_notification_history.json")
+METRICS_TOKEN = os.environ.get("METRICS_TOKEN", "") or os.environ.get("DASHBOARD_TOKEN", "")
+DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "https://stlinkdash-9eyizxud.manus.space").rstrip("/")
 USERS_FILE = os.environ.get("USERS_FILE", "users.json")
 USER_REGISTRY = {}
 USER_REGISTRY_SHA = None
@@ -69,18 +71,20 @@ async def handle(request):
 
 
 def _dashboard_authorized(request):
-    supplied = request.query.get("token", "")
-    expected = os.environ.get("DASHBOARD_TOKEN", "")
+    expected = METRICS_TOKEN
+    authorization = request.headers.get("Authorization", "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    supplied = supplied or request.headers.get("X-Metrics-Token", "")
     return bool(expected) and secrets.compare_digest(supplied, expected)
 
 
 def _dashboard_headers(request):
-    allowed = os.environ.get("DASHBOARD_ORIGIN", "")
+    allowed = DASHBOARD_ORIGIN
     origin = request.headers.get("Origin", "")
     return {
         "Access-Control-Allow-Origin": allowed if allowed and origin == allowed else "null",
         "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Metrics-Token",
         "Cache-Control": "no-store",
     }
 
@@ -89,8 +93,11 @@ async def dashboard_metrics(request):
     headers = _dashboard_headers(request)
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=headers)
+    if request.headers.get("Origin", "") not in {"", DASHBOARD_ORIGIN}:
+        return web.json_response({"error": "Origin not allowed"}, status=403, headers=headers)
     if not _dashboard_authorized(request):
-        return web.json_response({"error": "Dashboard authentication required"}, status=401, headers=headers)
+        headers["WWW-Authenticate"] = 'Bearer realm="STLINK Metrics"'
+        return web.json_response({"ok": False, "error": "metrics authentication required"}, status=401, headers=headers)
     elapsed = int(time.monotonic() - _start_time)
     active_scans = sum(1 for data in scan_tasks.values() if data.get("task") is not None and not data["task"].done())
     payload = {
@@ -108,7 +115,7 @@ async def dashboard_metrics(request):
 async def dashboard_page(request):
     if not _dashboard_authorized(request):
         return web.Response(status=401, text="Dashboard authentication required")
-    return web.Response(text="Dashboard API is online. Use /api/metrics?token=YOUR_DASHBOARD_TOKEN", content_type="text/plain")
+    return web.Response(text="Dashboard API is online. Use Authorization: Bearer <METRICS_TOKEN>", content_type="text/plain")
 
 
 async def web_server():
