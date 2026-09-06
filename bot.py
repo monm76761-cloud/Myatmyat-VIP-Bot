@@ -43,6 +43,14 @@ AUTO_NOTIFY_DAYS = tuple(sorted({int(value) for value in os.environ.get("AUTO_NO
 NOTIFICATION_HISTORY_FILE = os.environ.get("NOTIFICATION_HISTORY_FILE", "expiry_notification_history.json")
 METRICS_TOKEN = os.environ.get("METRICS_TOKEN", "") or os.environ.get("DASHBOARD_TOKEN", "")
 DASHBOARD_ORIGIN = os.environ.get("DASHBOARD_ORIGIN", "https://stlinkdash-9eyizxud.manus.space").rstrip("/")
+CORS_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get(
+        "CORS_ORIGINS",
+        f"{DASHBOARD_ORIGIN},https://monm76761-cloud.github.io",
+    ).split(",")
+    if origin.strip()
+}
 RESTART_COOLDOWN_SECONDS = max(30, int(os.environ.get("RESTART_COOLDOWN_SECONDS", "120")))
 _last_restart_request = 0.0
 USERS_FILE = os.environ.get("USERS_FILE", "users.json")
@@ -80,22 +88,33 @@ def _dashboard_authorized(request):
     return bool(expected) and secrets.compare_digest(supplied, expected)
 
 
+def _origin_allowed(request):
+    return request.headers.get("Origin", "").rstrip("/") in CORS_ORIGINS
+
+
 def _dashboard_headers(request):
-    allowed = DASHBOARD_ORIGIN
-    origin = request.headers.get("Origin", "")
+    origin = request.headers.get("Origin", "").rstrip("/")
     return {
-        "Access-Control-Allow-Origin": allowed if allowed and origin == allowed else "null",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Origin": origin if origin in CORS_ORIGINS else "null",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Metrics-Token",
+        "Vary": "Origin",
         "Cache-Control": "no-store",
     }
+
+
+async def cors_options(request):
+    headers = _dashboard_headers(request)
+    if not _origin_allowed(request):
+        return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403, headers=headers)
+    return web.Response(status=204, headers=headers)
 
 
 async def dashboard_metrics(request):
     headers = _dashboard_headers(request)
     if request.method == "OPTIONS":
-        return web.Response(status=204, headers=headers)
-    if request.headers.get("Origin", "") not in {"", DASHBOARD_ORIGIN}:
+        return await cors_options(request)
+    if request.headers.get("Origin", "").rstrip("/") not in CORS_ORIGINS:
         return web.json_response({"error": "Origin not allowed"}, status=403, headers=headers)
     if not _dashboard_authorized(request):
         headers["WWW-Authenticate"] = 'Bearer realm="STLINK Metrics"'
@@ -133,7 +152,7 @@ async def _restart_service_later():
 async def restart_endpoint(request):
     global _last_restart_request
     headers = _dashboard_headers(request)
-    if request.headers.get("Origin", "") not in {"", DASHBOARD_ORIGIN}:
+    if request.headers.get("Origin", "").rstrip("/") not in CORS_ORIGINS:
         return web.json_response({"ok": False, "error": "Origin not allowed"}, status=403, headers=headers)
     if not _dashboard_authorized(request):
         headers["WWW-Authenticate"] = 'Bearer realm="STLINK Restart"'
@@ -152,9 +171,9 @@ async def web_server():
     app = web.Application()
     app.router.add_get('/', handle)
     app.router.add_get('/dashboard', dashboard_page)
-    app.router.add_route('OPTIONS', '/api/metrics', dashboard_metrics)
+    app.router.add_route('OPTIONS', '/api/metrics', cors_options)
     app.router.add_get('/api/metrics', dashboard_metrics)
-    app.router.add_route('OPTIONS', '/api/restart', dashboard_metrics)
+    app.router.add_route('OPTIONS', '/api/restart', cors_options)
     app.router.add_post('/api/restart', restart_endpoint)
 
     runner = web.AppRunner(app)
