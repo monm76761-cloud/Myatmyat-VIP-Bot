@@ -68,6 +68,29 @@ CONCURRENCY = 2000
 def _proxy_kwargs():
     """Return a single configured egress proxy without exposing its credentials."""
     return {"proxy": HTTPS_PROXY_URL} if HTTPS_PROXY_URL else {}
+
+
+async def validate_proxy():
+    """Validate the configured proxy once; fall back to direct egress if unavailable."""
+    global HTTPS_PROXY_URL
+    if not HTTPS_PROXY_URL:
+        return False
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as check_session:
+            async with check_session.get(
+                "https://api.github.com/rate_limit",
+                headers={"accept": "application/json", "user-agent": "myatmyat-bot"},
+                proxy=HTTPS_PROXY_URL,
+            ) as response:
+                if response.status >= 500:
+                    raise RuntimeError(f"proxy returned HTTP {response.status}")
+        print("[proxy] configured HTTPS_PROXY_URL is reachable")
+        return True
+    except Exception as exc:
+        print(f"[proxy] configured egress unavailable; falling back to direct connection ({type(exc).__name__})")
+        HTTPS_PROXY_URL = ""
+        return False
 # Runtime scan-speed cap in codes/minute. None means unlimited.
 SPEED_LIMIT = None
 _voucher_sem = None
@@ -2470,6 +2493,7 @@ async def main():
         connector_owner=False
     )
     try:
+        await validate_proxy()
         await load_user_registry()
         if os.environ.get("DISABLE_BOT_WEB_SERVER", "0") != "1":
             asyncio.create_task(web_server())
