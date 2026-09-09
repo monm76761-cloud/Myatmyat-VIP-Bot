@@ -3,7 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 from telebot.async_telebot import AsyncTeleBot
+from telebot import asyncio_helper as telegram_asyncio_helper
 from aiohttp import web
+from aiohttp_socks import ProxyConnector
+from urllib.parse import quote
 import cv2
 import ddddocr
 import numpy as np
@@ -14,6 +17,62 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 ADMIN_ID = os.environ.get("ADMIN_ID", "")
 REPO_OWNER = os.environ.get("REPO_OWNER", "")
 REPO_NAME = os.environ.get("REPO_NAME", "")
+TELEGRAM_PROXY_SERVER = os.environ.get("TELEGRAM_PROXY_SERVER", "").strip()
+TELEGRAM_PROXY_PORT = os.environ.get("TELEGRAM_PROXY_PORT", "").strip()
+TELEGRAM_PROXY_USERNAME = os.environ.get("TELEGRAM_PROXY_USERNAME", "")
+TELEGRAM_PROXY_PASSWORD = os.environ.get("TELEGRAM_PROXY_PASSWORD", "")
+
+
+def build_telegram_proxy_url():
+    if not TELEGRAM_PROXY_SERVER or not TELEGRAM_PROXY_PORT:
+        return ""
+    try:
+        port = int(TELEGRAM_PROXY_PORT)
+    except ValueError as exc:
+        raise RuntimeError("TELEGRAM_PROXY_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("TELEGRAM_PROXY_PORT must be between 1 and 65535")
+    credentials = ""
+    if TELEGRAM_PROXY_USERNAME or TELEGRAM_PROXY_PASSWORD:
+        credentials = f"{quote(TELEGRAM_PROXY_USERNAME, safe='')}:{quote(TELEGRAM_PROXY_PASSWORD, safe='')}@"
+    return f"socks5://{credentials}{TELEGRAM_PROXY_SERVER}:{port}"
+
+
+class TelegramProxySessionManager(telegram_asyncio_helper.SessionManager):
+    def __init__(self, proxy_url):
+        super().__init__()
+        self.proxy_url = proxy_url
+
+    async def create_session(self):
+        if not self.proxy_url:
+            return await super().create_session()
+        self.session = aiohttp.ClientSession(
+            connector=ProxyConnector.from_url(
+                self.proxy_url,
+                rdns=True,
+                ssl=self.ssl_context,
+            )
+        )
+        return self.session
+
+
+def configure_telegram_proxy():
+    proxy_url = build_telegram_proxy_url()
+    telegram_asyncio_helper.session_manager = TelegramProxySessionManager(proxy_url)
+    if proxy_url:
+        print(f"[telegram-proxy] SOCKS5 enabled for Telegram API via {TELEGRAM_PROXY_SERVER}:{TELEGRAM_PROXY_PORT}")
+    else:
+        print("[telegram-proxy] disabled; Telegram API will use the direct connection")
+    return proxy_url
+
+
+async def validate_telegram_connection():
+    me = await bot.get_me()
+    if not me or not getattr(me, "id", None):
+        raise RuntimeError("Telegram API returned an invalid bot identity")
+    print(f"[telegram] API connection healthy as @{getattr(me, 'username', None) or 'bot'}")
+
+
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 user_data = {}
@@ -2493,7 +2552,9 @@ async def main():
         connector_owner=False
     )
     try:
+        configure_telegram_proxy()
         await validate_proxy()
+        await validate_telegram_connection()
         await load_user_registry()
         if os.environ.get("DISABLE_BOT_WEB_SERVER", "0") != "1":
             asyncio.create_task(web_server())
@@ -2501,8 +2562,11 @@ async def main():
         asyncio.create_task(auto_expiry_notification_scheduler())
         await start_polling()
     finally:
-        await session.close()
-        await _connector.close()
+        try:
+            await bot.close_session()
+        finally:
+            await session.close()
+            await _connector.close()
 
 if __name__ == '__main__':
     asyncio.run(main())
